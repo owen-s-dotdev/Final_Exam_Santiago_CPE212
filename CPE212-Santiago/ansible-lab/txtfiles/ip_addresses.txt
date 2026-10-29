@@ -1,0 +1,13 @@
+# HOME MACHINES
+# IP HOSTNAME USERNAME
+
+192.168.56.101  workstation workstation
+192.168.56.102  server1 server1
+192.168.56.103  server2 server2
+192.168.56.104  centos  santiago
+
+# LAB MACHINES
+192.168.56.119  workstation
+192.168.56.114  server1 server1
+192.168.56.115  server2 santiagoserver2
+192.168.56.118  centos1 santiago

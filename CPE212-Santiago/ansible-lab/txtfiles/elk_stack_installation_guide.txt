@@ -1,0 +1,137 @@
+================================================================================
+ELK STACK INSTALLATION GUIDE (UBUNTU & CENTOS)
+================================================================================
+Source: https://medium.com/@justinsanthiyagu/installing-the-elk-stack-on-ubuntu-server-d823769b9e3e
+
+--------------------------------------------------------------------------------
+STEP 1: INSTALL JAVA DEPENDENCIES
+--------------------------------------------------------------------------------
+Elasticsearch is built on Java and requires a JVM to run.
+
+[ Ubuntu ]
+sudo apt update
+sudo apt install default-jre default-jdk -y
+
+[ CentOS ]
+sudo dnf install java-17-openjdk-devel -y
+
+--------------------------------------------------------------------------------
+STEP 2: IMPORT THE ELASTICSEARCH PGP KEY
+--------------------------------------------------------------------------------
+A PGP key is required to cryptographically verify downloaded packages.
+
+[ Ubuntu ]
+wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch | sudo gpg --dearmor -o /usr/share/keyrings/elasticsearch-keyring.gpg
+
+[ CentOS ]
+sudo rpm --import https://artifacts.elastic.co/GPG-KEY-elasticsearch
+
+--------------------------------------------------------------------------------
+STEP 3: INSTALL ELASTICSEARCH
+--------------------------------------------------------------------------------
+The Elastic repository must be added before installing.
+
+[ Ubuntu ]
+1. sudo apt-get install apt-transport-https
+2. echo "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/9.x/apt stable main" | sudo tee /etc/apt/sources.list.d/elastic-9.x.list
+3. sudo apt-get update && sudo apt-get install elasticsearch
+
+[ CentOS ]
+1. Create a repository file at /etc/yum.repos.d/elastic.repo and paste the following text:
+   [elastic-9.x]
+   name=Elastic repository for 9.x packages
+   baseurl=https://artifacts.elastic.co/packages/9.x/yum
+   gpgcheck=1
+   gpgkey=https://artifacts.elastic.co/GPG-KEY-elasticsearch
+   enabled=1
+   autorefresh=1
+   type=rpm-md
+
+2. sudo dnf install elasticsearch
+
+--------------------------------------------------------------------------------
+STEP 4: CONFIGURE AND START ELASTICSEARCH
+--------------------------------------------------------------------------------
+The main config file is at /etc/elasticsearch/elasticsearch.yml. 
+Both Ubuntu and CentOS use systemd, so the service commands are identical.
+
+[ Both Ubuntu & CentOS ]
+systemctl daemon-reload
+systemctl restart elasticsearch
+systemctl enable elasticsearch
+systemctl status elasticsearch
+
+--------------------------------------------------------------------------------
+STEP 5: INSTALL AND START LOGSTASH
+--------------------------------------------------------------------------------
+
+[ Ubuntu ]
+apt install logstash
+systemctl enable logstash
+systemctl start logstash
+
+[ CentOS ]
+sudo dnf install logstash
+systemctl enable logstash
+systemctl start logstash
+
+--------------------------------------------------------------------------------
+STEP 6: INSTALL AND CONFIGURE KIBANA
+--------------------------------------------------------------------------------
+
+[ Ubuntu ]
+apt install kibana
+
+[ CentOS ]
+sudo dnf install kibana
+
+[ SYSTEM AND APPLICATION CONFIGURATION (Both Ubuntu & CentOS) ]
+
+1. Generate Built-In User Passwords:
+/usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic
+/usr/share/elasticsearch/bin/elasticsearch-reset-password -u kibana_system
+
+2. Fix Certificate and Directory Permissions:
+chmod 755 /etc/elasticsearch
+chmod 755 /etc/elasticsearch/certs
+chown elasticsearch:kibana /etc/elasticsearch/certs/http_ca.crt
+chmod 640 /etc/elasticsearch/certs/http_ca.crt
+cp /etc/elasticsearch/certs/http_ca.crt /etc/kibana/
+chown kibana:kibana /etc/kibana/http_ca.crt
+chmod 640 /etc/kibana/http_ca.crt
+
+3. Restart Services and Verify:
+systemctl daemon-reexec
+systemctl restart elasticsearch
+sleep 10
+systemctl restart kibana
+systemctl status kibana
+ss -tulnp | grep 5601
+
+--------------------------------------------------------------------------------
+STEP 7: ENABLE SSL ON KIBANA
+--------------------------------------------------------------------------------
+Enabling HTTPS on the Kibana web interface is required for production. 
+File paths and utilities are identical on both operating systems.
+
+[ Both Ubuntu & CentOS ]
+
+1. Generate and Extract SSL Certificates:
+/usr/share/elasticsearch/bin/elasticsearch-certutil cert --pem -out kibana-cert.zip
+unzip kibana-cert.zip -d /etc/kibana/certs
+mv /etc/kibana/certs/instance/instance.crt /etc/kibana/certs/kibana.crt
+mv /etc/kibana/certs/instance/instance.key /etc/kibana/certs/kibana.key
+
+2. Set Certificate Permissions:
+chown -R kibana:kibana /etc/kibana/certs
+chmod 750 /etc/kibana/certs
+chmod 640 /etc/kibana/certs/*
+
+3. Configure CA Certificate for Kibana:
+cp /etc/elasticsearch/certs/http_ca.crt /etc/kibana/
+chown kibana:kibana /etc/kibana/http_ca.crt
+chmod 640 /etc/kibana/http_ca.crt
+
+4. Restart Kibana and Validate Port:
+systemctl restart kibana
+ss -tulnp | grep 5601

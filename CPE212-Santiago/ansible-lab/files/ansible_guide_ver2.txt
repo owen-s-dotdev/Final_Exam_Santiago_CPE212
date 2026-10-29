@@ -1,0 +1,1229 @@
+################################################################################
+#  Lab hosts: ubuntu1 (web_servers, workstations) | ubuntu2 (db_servers)
+#             centos1 (web_servers, file_servers)
+################################################################################
+
+################################################################################
+# 0. COMMANDS YOU MUST KNOW
+################################################################################
+# ansible --version
+# ansible-inventory --list | --graph          # parsed inventory / tree
+# ansible all -m ping                         # connectivity ("pong")
+# ansible web_servers -m command -a "uptime"  # ad-hoc
+# ansible all -m setup -a "filter=ansible_distribution*"   # facts
+# ansible all -b -m apt -a "name=git state=present"        # -b = become
+# ansible-doc -l | grep docker   ;  ansible-doc file       # module docs (allowed lifesaver)
+#
+# ansible-playbook site.yml                       # run
+# ansible-playbook site.yml --syntax-check
+# ansible-playbook site.yml --check --diff        # dry run + show changes
+# ansible-playbook site.yml --list-tasks | --list-hosts | --list-tags
+# ansible-playbook site.yml -l ubuntu1            # limit hosts
+# ansible-playbook site.yml -t web,db             # only these tags
+# ansible-playbook site.yml --skip-tags db
+# ansible-playbook site.yml -e "app_name=web"     # extra vars (highest precedence)
+# ansible-playbook site.yml -K                    # ask become password
+# ansible-playbook site.yml --ask-vault-pass | --vault-password-file .vp
+# ansible-playbook site.yml -v | -vv | -vvv
+# ansible-playbook site.yml --start-at-task "Install Docker"
+#
+# ansible-vault create|edit|view|encrypt|decrypt|rekey  group_vars/all/vault.yml
+# ansible-vault encrypt_string 'MyPass' --name 'vault_elastic_password'
+# ansible-galaxy init roles/web                   # role skeleton
+# ansible-galaxy install <role> | collection install community.docker
+# ansible-galaxy collection install ansible.posix community.general community.docker community.mysql
+# ansible-lint site.yml
+
+################################################################################
+# 1. ansible.cfg  (YOUR REAL FILE)
+################################################################################
+# [defaults]
+# roles_path = ./roles
+# inventory = lab_inventory.yml          # (home_inventory.yaml for home network)
+# deprecation_warnings=False
+#
+# [privilege_escalation]
+# become = True
+# become_method = sudo
+# become_user = root
+# become_ask_pass = True                 # prompts for sudo password every run
+#
+# [ssh_connection]
+# pipelining = True                      # faster: fewer SSH ops per task
+#
+# Search order: $ANSIBLE_CONFIG > ./ansible.cfg > ~/.ansible.cfg > /etc/ansible/ansible.cfg
+
+################################################################################
+# 2. INVENTORY (YAML) - lab_inventory.yml (YOUR REAL FILE, trimmed)
+################################################################################
+all:
+  children:
+    ubuntu:
+      hosts:
+        ubuntu1:
+          ansible_host: 192.168.56.114
+          ansible_user: server1
+        ubuntu2:
+          ansible_host: 192.168.56.115
+          ansible_user: santiagoserver2
+    centos:
+      hosts:
+        centos1:
+          ansible_host: 192.168.56.118
+          ansible_user: santiago
+    redhat:                         # group-level vars (used by install_apache.yml)
+      vars:
+        apache_package: httpd
+        php_package: php
+    web_servers:
+      hosts: { ubuntu1: {}, centos1: {} }
+    db_servers:
+      hosts: { ubuntu2: {} }
+    file_servers:
+      hosts: { centos1: {} }
+    workstations:
+      hosts: { ubuntu1: {} }
+    linuxservers:                   # group of groups
+      children:
+        ubuntu:
+        centos:
+        redhat:
+
+# INI equivalent:
+# [web_servers]
+# ubuntu1 ansible_host=192.168.56.114 ansible_user=server1
+# [linuxservers:children]
+# ubuntu
+# centos
+# [all:vars]
+# ansible_python_interpreter=/usr/bin/python3
+#
+# Host patterns:  all | web_servers:db_servers (union) | web_servers:&file_servers (intersection)
+#                 web_servers:!centos1 (exclude) | 'ubuntu*' (wildcard)
+#                 hosts: web_servers:db_servers   <- used in install_docker.yml
+#
+# Variable precedence (low -> high):
+#  role defaults < inventory/group_vars/all < group_vars/<group> < host_vars < play vars
+#  < vars_files < role vars < task vars < set_fact/register < extra vars (-e)
+
+################################################################################
+# 3. GROUP_VARS + VAULT (YOUR REAL FILES)
+################################################################################
+# --- group_vars/all/main.yml ---
+# elastic_series: "9.x"
+# elastic_gpg_key_url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+# elastic_keyring_path: /usr/share/keyrings/elasticsearch-keyring.gpg
+# elastic_apt_repo: "deb [signed-by={{ elastic_keyring_path }}] https://artifacts.elastic.co/packages/{{ elastic_series }}/apt stable main"
+# elastic_yum_baseurl: "https://artifacts.elastic.co/packages/{{ elastic_series }}/yum"
+# es_primary_host: "{{ groups['web_servers'][0] }}"                     # first host in a group
+# es_primary_addr: "{{ hostvars[es_primary_host].ansible_host }}"       # read ANOTHER host's var
+# es_elastic_password: "{{ vault_elastic_password }}"                   # points at vaulted var
+#
+# --- group_vars/all/vault.yml (encrypted with ansible-vault) ---
+# vault_elastic_password: "<secret>"
+#
+# --- group_vars/db_servers.yml ---          --- group_vars/web_servers.yml ---
+# app_name: db                                app_name: web
+# app_image: custom-mariadb                   app_image: custom-apache
+# app_dockerfile: Dockerfile.mariadb          app_dockerfile: Dockerfile.apache
+# app_ports: ["3306:3306"]                    app_ports: ["8080:80"]
+#
+# KEY IDEA: same role (container_app) + different group_vars = different result per group.
+# Naming rule: group_vars/<group>.yml or group_vars/<group>/*.yml ; host_vars/<host>.yml
+# Prefix vault vars with vault_ and reference them from a plain var (best practice).
+
+################################################################################
+# 4. FILE MODULE & FRIENDS (YOUR plays/past_plays/*)
+################################################################################
+---
+- name: File module patterns
+  hosts: web_servers
+  tasks:
+    - name: Create a directory
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/ansible-directory"
+        state: directory                  # file|directory|link|hard|touch|absent
+
+    - name: Create empty file (touch)
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/ansible_test.txt"
+        state: touch
+
+    - name: Create symbolic link
+      ansible.builtin.file:
+        src: "{{ ansible_env.HOME }}/source_file.txt"
+        dest: "{{ ansible_env.HOME }}/source_link.txt"
+        state: link
+
+    - name: Delete file / directory / symlink
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/source_link.txt"
+        state: absent
+
+    - name: Numeric permissions
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/permission_test.txt"
+        state: touch
+        mode: '0644'                      # ALWAYS quote octal
+
+    - name: Symbolic permissions
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/symbolic-test"
+        state: directory
+        mode: 'u=rwx,g=rx,o=rx'
+
+    - name: Ownership (needs become)
+      become: true
+      ansible.builtin.file:
+        path: /tmp/ansible-ownership-test
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+        # recurse: yes                    # apply to contents
+
+    - name: Set timestamps
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/timestamp_test.txt"
+        state: touch
+        access_time: now
+        modification_time: "202609080800.00"     # YYYYMMDDHHMM.SS
+
+    - name: Multiple files with loop
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/{{ item }}"
+        state: touch
+      loop: [file1.txt, file2.txt, file3.txt]
+
+    - name: File with content
+      ansible.builtin.copy:
+        dest: "{{ ansible_env.HOME }}/student_info.txt"
+        content: |
+          Name: David Owen Santiago
+          Course: Computer Engineering
+
+    - name: Copy file from control node (looks in files/ of play or role)
+      become: true
+      ansible.builtin.copy:
+        src: files/default_site.html
+        dest: /var/www/html/index.html
+        owner: root
+        group: root
+        mode: '0644'
+        # backup: yes | remote_src: yes (copy on the remote itself)
+
+    - name: Template (Jinja2) from templates/
+      ansible.builtin.template:
+        src: heap.options.j2
+        dest: /etc/elasticsearch/jvm.options.d/heap.options
+        owner: root
+        group: elasticsearch
+        mode: "0660"
+        # validate: "visudo -cf %s"
+
+    - name: Edit ONE line (regexp + line)
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin no'
+        # state: absent removes matching line ; backup: yes
+
+    - name: Insert a block
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} ANSIBLE MANAGED"
+        block: |
+          192.168.56.114 ubuntu1
+
+    - name: Regex replace everywhere in file
+      ansible.builtin.replace:
+        path: /etc/app.conf
+        regexp: 'port=\d+'
+        replace: 'port=8080'
+
+    - name: Stat (exists?)
+      ansible.builtin.stat:
+        path: /etc/nginx/nginx.conf
+      register: conf
+    - ansible.builtin.debug: { msg: "exists" }
+      when: conf.stat.exists
+
+    - name: Download (get_url) / extract (unarchive)
+      ansible.builtin.get_url:
+        url: https://example.com/file.tar.gz
+        dest: /tmp/file.tar.gz
+        mode: '0644'
+    - ansible.builtin.unarchive:
+        src: /tmp/file.tar.gz
+        dest: /opt
+        remote_src: yes                   # archive already on remote/URL
+        creates: /opt/file/bin            # skip if exists (idempotent)
+        # extra_opts: [--strip-components=1]
+
+    - name: Read remote file to control node (base64) - used for ES CA cert
+      ansible.builtin.slurp:
+        src: /etc/elasticsearch/certs/http_ca.crt
+      register: es_ca                     # use: {{ es_ca.content | b64decode }}
+
+    - name: fetch (remote -> control node) / find
+      ansible.builtin.fetch: { src: /etc/hostname, dest: fetched/ }
+
+################################################################################
+# 5. PACKAGES, SERVICES, USERS, FIREWALL, MISC MODULES
+################################################################################
+---
+- name: Core system modules
+  hosts: all
+  become: true
+  tasks:
+    # ---- package managers ----
+    - name: apt (Ubuntu) - update cache + dist-upgrade (YOUR site.yml)
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: yes
+        # name: [apache2, libapache2-mod-php]  state: present|latest|absent
+      when: ansible_distribution == "Ubuntu"
+      tags: always
+
+    - name: dnf (CentOS) - update only (YOUR site.yml)
+      ansible.builtin.dnf:
+        update_only: yes
+        update_cache: yes
+        # name: [httpd, php]  state: latest
+      when: ansible_distribution == "CentOS"
+      tags: always
+
+    - name: package (distro-agnostic - YOUR install_apache.yml uses inventory vars)
+      ansible.builtin.package:
+        name:
+          - "{{ apache_package }}"        # httpd on redhat group
+          - "{{ php_package }}"
+        state: latest
+
+    - name: pip / rpm_key / yum_repository / apt_repository
+      ansible.builtin.pip: { name: docker, state: present }
+
+    # ---- services ----
+    - name: service (generic)
+      ansible.builtin.service:
+        name: httpd
+        state: started                    # started|stopped|restarted|reloaded
+        enabled: true
+
+    - name: systemd (daemon_reload, multiple units with loop - YOUR docker role)
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+        daemon_reload: true
+      loop: [docker.service, docker.socket]
+
+    # ---- users / groups / ssh / cron ----
+    - name: group (system group)
+      ansible.builtin.group: { name: prometheus, system: true, state: present }
+
+    - name: user (service account, no login - YOUR prometheus role)
+      ansible.builtin.user:
+        name: prometheus
+        group: prometheus
+        shell: "{{ '/bin/false' if ansible_os_family == 'Debian' else '/sbin/nologin' }}"
+        create_home: false
+        system: true
+        state: present
+
+    - name: Add existing user to docker group (append! else it REPLACES groups)
+      ansible.builtin.user:
+        name: "{{ ansible_user | default(lookup('env', 'USER')) }}"
+        groups: docker
+        append: true
+
+    - name: authorized_key / cron / hostname / timezone
+      ansible.posix.authorized_key:
+        user: alice
+        key: "{{ lookup('file', '~/.ssh/id_rsa.pub') }}"
+    - ansible.builtin.cron:
+        name: "daily backup"
+        minute: "0"
+        hour: "2"
+        job: "/usr/local/bin/backup.sh"
+
+    # ---- firewall / selinux / sysctl ----
+    - name: ufw (Ubuntu)
+      community.general.ufw:
+        rule: allow
+        port: "9200"
+        proto: tcp
+      when: ansible_os_family == "Debian"
+
+    - name: firewalld (CentOS) - port OR service
+      ansible.posix.firewalld:
+        port: 9200/tcp                    # or: service: http
+        permanent: true
+        immediate: true
+        state: enabled
+      when: ansible_os_family == "RedHat"   # CASE-SENSITIVE: "RedHat" not "Redhat"
+
+    - name: SELinux permissive (YOUR nagios play)
+      ansible.posix.selinux:
+        policy: targeted
+        state: permissive
+      when: ansible_facts['os_family'] == 'RedHat'
+
+    - name: sysctl
+      ansible.posix.sysctl:
+        name: vm.max_map_count
+        value: '262144'
+        reload: yes
+
+    - name: apache2_module (Ubuntu only)
+      community.general.apache2_module:
+        name: "{{ item }}"
+        state: present
+      loop: [rewrite, cgi]
+      when: ansible_facts['os_family'] == 'Debian'
+
+    # ---- commands / checks ----
+    - name: command (no pipes) with idempotency guard
+      ansible.builtin.command:
+        cmd: make install
+        chdir: /tmp/nagios-build
+        creates: /usr/local/nagios/bin/nagios      # skip if this exists
+        # removes: <path>  -> run only if path exists
+
+    - name: shell (pipes/redirects) with guard
+      ansible.builtin.shell:
+        cmd: htpasswd -b -c /usr/local/nagios/etc/htpasswd.users 'nagiosadmin' 'pass'
+        creates: /usr/local/nagios/etc/htpasswd.users
+
+    - name: raw (no Python needed on target) / script (run local script remotely)
+      ansible.builtin.raw: uptime
+
+    - name: uri (HTTP check)
+      ansible.builtin.uri:
+        url: "http://localhost:8080"
+        status_code: 200
+        # method: POST  user/password/force_basic_auth  body_format: json  body: {...}
+        # validate_certs: false (self-signed lab only)  return_content: yes
+
+    - name: wait_for (port up)
+      ansible.builtin.wait_for:
+        port: 5601
+        timeout: 180
+        # host:  delay:  state: started|stopped  path: /file  search_regex:
+
+    - name: git / reboot / pause / debug / fail / assert
+      ansible.builtin.git:
+        repo: https://github.com/owen-s-dotdev/CPE212-Santiago.git
+        dest: /opt/CPE212
+        version: main
+    - ansible.builtin.reboot: { reboot_timeout: 300 }
+      when: false
+
+################################################################################
+# 6. VARIABLES, FACTS, CONDITIONALS, LOOPS, BLOCKS, ERROR HANDLING
+################################################################################
+---
+- name: Logic and data
+  hosts: all
+  gather_facts: true                      # false = faster, no ansible_* facts
+  vars:
+    packages: [git, curl]
+    app: { name: demo, port: 8080 }
+  vars_files: [vars/common.yml]
+  vars_prompt:
+    - { name: env_name, prompt: "Env?", private: false, default: dev }
+  tasks:
+    # --- facts you actually use ---
+    - ansible.builtin.debug:
+        msg: >
+          {{ ansible_distribution }} {{ ansible_distribution_version }}
+          family={{ ansible_os_family }} host={{ ansible_hostname }}
+          ip={{ ansible_default_ipv4.address }} ram={{ ansible_memtotal_mb }}MB
+          arch={{ ansible_architecture }} codename={{ ansible_distribution_release }}
+    # ansible_facts['os_family'] == ansible_os_family  (both styles are valid)
+
+    # --- magic variables ---
+    - ansible.builtin.debug:
+        msg:
+          - "{{ inventory_hostname }}"
+          - "{{ groups['web_servers'] }}"
+          - "{{ group_names }}"
+          - "{{ hostvars['ubuntu2'].ansible_host }}"
+          - "{{ playbook_dir }}"
+          - "{{ ansible_user }}"
+
+    # --- register / set_fact ---
+    - ansible.builtin.command: whoami
+      register: who
+      changed_when: false                 # command is always 'changed' otherwise
+    - ansible.builtin.debug: { var: who.stdout }   # .rc .stderr .stdout_lines .changed .failed
+    - ansible.builtin.set_fact: { url: "http://{{ ansible_host }}:{{ app.port }}" }
+
+    # --- conditionals (no {{ }} in when) ---
+    - ansible.builtin.debug: { msg: "Ubuntu or CentOS" }
+      when: ansible_distribution == "Ubuntu" or ansible_distribution == "CentOS"
+    - ansible.builtin.debug: { msg: "multi-condition AND" }
+      when:
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version | int >= 9
+    - ansible.builtin.debug: { msg: "defined/changed tests" }
+      when: who is defined and who is changed
+
+    # --- inline if (used for service/user names) ---
+    - ansible.builtin.debug:
+        msg: "{{ 'apache2' if ansible_facts['os_family'] == 'Debian' else 'httpd' }}"
+
+    # --- loops ---
+    - ansible.builtin.user: { name: "{{ item }}" }
+      loop: [user1, user2]
+    - ansible.builtin.debug: { msg: "{{ item.name }} -> {{ item.g }}" }
+      loop: [{ name: a, g: devops }, { name: b, g: ops }]
+    - ansible.builtin.debug: { msg: "{{ item.key }}={{ item.value }}" }
+      loop: "{{ {'a': 1, 'b': 2} | dict2items }}"
+    - ansible.builtin.debug: { msg: "{{ idx }} {{ item }}" }
+      loop: [x, y]
+      loop_control: { index_var: idx, label: "{{ item }}" }
+    # item.split(':')[0] pattern (YOUR container_app): "8080:80" -> "8080"
+    # legacy: with_items: [..]
+
+    # --- retry until ---
+    - ansible.builtin.command: docker exec db mariadb -e "SELECT 1"
+      register: db_check
+      retries: 5
+      delay: 5
+      until: db_check.rc == 0
+      changed_when: false
+
+    # --- error handling ---
+    - ansible.builtin.command: grep -q '^elasticsearch.hosts' /etc/kibana/kibana.yml
+      register: kibana_enrolled
+      failed_when: kibana_enrolled.rc > 1    # rc 0=found 1=not found 2=error (YOUR enroll.yml)
+      changed_when: false
+    - ansible.builtin.command: /bin/false
+      ignore_errors: true
+    - ansible.builtin.assert:
+        that: ansible_memtotal_mb >= 2048
+        fail_msg: "Need 2GB RAM"
+    - ansible.builtin.fail: { msg: "Unsupported OS" }
+      when: ansible_os_family not in ['Debian', 'RedHat']
+
+    - block:
+        - ansible.builtin.command: /bin/false
+      rescue:
+        - ansible.builtin.debug: { msg: "recovering" }
+      always:
+        - ansible.builtin.debug: { msg: "cleanup" }
+
+    # --- secrets in logs ---
+    - ansible.builtin.command: echo secret
+      no_log: true
+
+    # --- delegation / run_once ---
+    - name: Run on ES host but for the Kibana host (YOUR enroll.yml)
+      ansible.builtin.command: >
+        /usr/share/elasticsearch/bin/elasticsearch-create-enrollment-token -s kibana
+      delegate_to: "{{ es_primary_host }}"
+      register: kibana_token
+    - ansible.builtin.debug: { msg: "only once" }
+      run_once: true
+
+    # --- includes ---
+    - ansible.builtin.include_tasks: "install_{{ ansible_os_family | lower }}.yml"   # dynamic
+    - ansible.builtin.import_tasks: extra.yml                                      # static
+    - ansible.builtin.meta: flush_handlers      # run pending handlers NOW
+    - ansible.builtin.meta: reset_connection    # re-open SSH (after group change)
+
+# Useful filters: default('x') | upper | lower | join(',') | int | trim | last | first
+#   | b64decode | to_nice_yaml | to_nice_json | basename | password_hash('sha512')
+#   | map(attribute='n') | selectattr('active') | dict2items | split(',') | length
+# Lookups: lookup('file','path') lookup('env','HOME') lookup('pipe','date') lookup('password','/dev/null')
+# Jinja2 in templates: {{ var }}  {% for h in groups['web_servers'] %}...{% endfor %}  {% if %}...{% endif %}
+
+################################################################################
+# 7. HANDLERS, TAGS, ORDER OF EXECUTION
+################################################################################
+# - Handlers run ONCE at the END of the play, only if notified AND the task changed.
+# - notify: can be a list. Handler name must match exactly.
+# - Order: pre_tasks -> (handlers) -> roles -> tasks -> (handlers) -> post_tasks -> (handlers)
+# - tags: always (always runs unless --skip-tags always) ; never ; multiple: [a, b]
+# - Tags on a role in the play are applied to every task in that role.
+---
+- name: Handler + tag demo
+  hosts: web_servers
+  become: true
+  tasks:
+    - name: Configure
+      ansible.builtin.template:
+        src: x.j2
+        dest: /etc/x.conf
+      tags: [config]
+      notify:
+        - Restart x
+        - Reload systemd
+  handlers:
+    - name: Restart x
+      ansible.builtin.systemd: { name: x, state: restarted }
+    - name: Reload systemd
+      ansible.builtin.systemd: { daemon_reload: true }
+
+################################################################################
+# 8. YOUR REAL PLAYBOOKS
+################################################################################
+# ---- 8.1 site.yml (master playbook: updates + roles per group) ----
+---
+- hosts: all
+  become: true
+  pre_tasks:
+    - name: install updates (CentOS)
+      tags: always
+      dnf:
+        update_only: yes
+        update_cache: yes
+      when: ansible_distribution == "CentOS"
+
+    - name: install updates (Ubuntu)
+      tags: always
+      apt:
+        upgrade: dist
+        update_cache: yes
+      when: ansible_distribution == "Ubuntu"
+
+- hosts: workstations
+  become: true
+  roles:
+    - role: workstations
+      tags: workstation
+
+- hosts: web_servers
+  become: true
+  roles:
+    - role: web
+      tags: web
+
+- hosts: db_servers
+  become: true
+  roles:
+    - role: db
+      tags: db
+
+- hosts: file_servers
+  become: true
+  roles:
+    - role: file_servers
+      tags: file_server
+# Run subset:  ansible-playbook site.yml -t web   |   --skip-tags db
+
+# ---- 8.2 install_docker.yml (hosts using a union pattern) ----
+---
+- hosts: web_servers:db_servers
+  become: true
+  pre_tasks:
+    - name: Update apt packages
+      ansible.builtin.apt: { update_cache: true }
+      when: ansible_os_family == 'Debian'
+    - name: Update dnf packages
+      ansible.builtin.dnf: { update_cache: true }
+      when: ansible_os_family == 'RedHat'
+  roles:
+    - role: docker
+      tags: docker
+
+# ---- 8.3 deploy_web.yml (pre_tasks check + role + post_tasks verification) ----
+---
+- name: Build and run the Apache container
+  hosts: web_servers
+  become: true
+  pre_tasks:
+    - name: Check Docker if it is installed
+      ansible.builtin.command: docker --version
+      changed_when: false
+  roles:
+    - container_app                       # vars come from group_vars/web_servers.yml
+  post_tasks:
+    - name: Check that Apache responds
+      ansible.builtin.uri:
+        url: "http://localhost:8080"
+        status_code: 200
+      retries: 5
+      delay: 3
+      register: web_check
+      until: web_check.status == 200
+
+# ---- 8.4 deploy_db.yml (same role, db_servers vars) ----
+---
+- name: Build and run the MariaDB container
+  hosts: db_servers
+  become: true
+  pre_tasks:
+    - ansible.builtin.command: docker --version
+      changed_when: false
+  roles:
+    - container_app
+  post_tasks:
+    - name: Check that MariaDB responds
+      ansible.builtin.command: docker exec db mariadb -e "SELECT 1"
+      register: db_check
+      retries: 5
+      delay: 5
+      until: db_check.rc == 0
+      changed_when: false
+
+# ---- 8.5 ELK: one play per role + import_playbook in dependency order ----
+# plays/elasticsearch.yml
+---
+- name: Install and configure Elasticsearch
+  hosts: web_servers
+  become: true
+  roles: [elasticsearch]
+# plays/kibana.yml     -> hosts: db_servers    roles: [kibana]
+# plays/logstash.yml   -> hosts: workstations  roles: [logstash]
+# plays/install_elk_all.yml
+---
+- import_playbook: elasticsearch.yml      # 1st: ES must exist
+- import_playbook: kibana.yml             # 2nd: needs ES enrollment token
+- import_playbook: logstash.yml           # 3rd: needs ES CA cert + password
+# Run:  ansible-playbook plays/install_elk_all.yml --ask-vault-pass
+
+# ---- 8.6 install_nagios.yml - PATTERNS TO REMEMBER (build from source) ----
+# - vars: web_server_service: "{{ 'apache2' if ansible_facts['os_family']=='Debian' else 'httpd' }}"
+# - separate package tasks per OS family (apt vs dnf) with when:
+# - dnf enablerepo: [epel, "{{ 'crb' if ansible_facts['distribution_major_version']|int >= 9 else 'powertools' }}"]
+# - unarchive remote_src + extra_opts [--strip-components=1] + creates:
+# - command: ./configure / make all / make install ... each with chdir + creates: (idempotent)
+# - handlers: Restart Web Server / Restart Nagios (notify list)
+# - loop firewalld services: [http, https]
+# - shell htpasswd with creates:
+# ! In the repo, one dnf task has broken indentation (name:/state: not under the module) and
+#   "when_ansible_distribution: CentOS" is not valid -> must be:
+#     - ansible.builtin.dnf:
+#         name: [gcc, make]
+#         state: present
+#       when: ansible_distribution == "CentOS"
+
+################################################################################
+# 9. YOUR REAL ROLES (tasks/main.yml contents)
+################################################################################
+# Role skeleton (ansible-galaxy init):
+#   roles/<name>/{defaults,vars,tasks,handlers,meta,templates,files,tests}/ + README.md
+#   defaults/main.yml = lowest precedence (override me)   vars/main.yml = high precedence
+#   tasks/main.yml    = entry point                       meta/main.yml = dependencies: [..]
+#   copy/template/script look in the role's files/ and templates/ automatically.
+#   Tasks in role files do NOT have a "tasks:" key; they are a plain list.
+
+# ---- 9.1 roles/web/tasks/main.yml ----
+- name: Install Apache2 package and PHP Support Ubuntu
+  tags: apache, apache2, ubuntu
+  apt:
+    name: [apache2, libapache2-mod-php]
+    state: latest
+    update_cache: yes
+  when: ansible_distribution == "Ubuntu"
+
+- name: Install Apache2 package and PHP Support CentOS
+  tags: apache, centos, httpd
+  dnf:
+    name: [httpd, php]
+    state: latest
+    update_cache: yes
+  when: ansible_distribution == "CentOS"
+
+- name: start httpd (CentOS)
+  service:
+    name: httpd
+    state: started
+    enabled: true
+  when: ansible_distribution == "CentOS"
+
+- name: "Print Confirm if Successful"
+  debug:
+    msg: "Apache and PHP are installed and running successfully."
+
+- name: copy default html file for site
+  tags: apache, apache2, httpd, copy_html
+  ansible.builtin.copy:
+    src: files/default_site.html            # roles/web/files/ or play-level files/
+    dest: /var/www/html/index.html
+    owner: root
+    group: root
+    mode: '0644'
+
+# ---- 9.2 roles/db/tasks/main.yml ----
+- name: install mariadb package (CentOS)
+  dnf: { name: mariadb-server, state: latest }
+  when: ansible_distribution == "CentOS"
+- name: install mariadb package (Ubuntu)
+  apt: { name: mariadb-server, state: latest }
+  when: ansible_distribution == "Ubuntu"
+- name: "Mariadb - Restarting/Enabling"
+  service: { name: mariadb, state: restarted, enabled: true }
+
+# ---- 9.3 roles/file_servers/tasks/main.yml ----
+- name: install samba package
+  tags: samba
+  package: { name: samba, state: latest }
+
+# ---- 9.4 roles/workstations/tasks/main.yml ----
+- name: install unzip
+  package: { name: unzip }
+- name: install terraform
+  unarchive:
+    src: https://releases.hashicorp.com/terraform/0.12.28/terraform_0.12.28_linux_amd64.zip
+    dest: /usr/local/bin
+    remote_src: yes
+    mode: 0755
+    owner: root
+    group: root
+
+# ---- 9.5 roles/docker  (OS-split with include_tasks) ----
+# tasks/main.yml
+- name: Install Docker
+  ansible.builtin.include_tasks: "install_{{ ansible_os_family | lower }}.yml"   # install_debian.yml / install_redhat.yml
+- name: Enable and start Docker and its socket
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+  loop: [docker.service, docker.socket]
+- name: Add the connecting user to the docker group
+  ansible.builtin.user:
+    name: "{{ ansible_user | default(lookup('env', 'USER')) }}"
+    groups: docker
+    append: true
+- name: Apply the new group membership
+  ansible.builtin.meta: reset_connection
+# handlers/main.yml:  - name: Restart Docker  /  ansible.builtin.systemd: {name: docker.service, state: restarted}
+
+# tasks/install_debian.yml (key tasks)
+- ansible.builtin.apt: { name: [ca-certificates, curl], state: present, update_cache: true }
+- ansible.builtin.apt:                       # remove conflicting old packages
+    name: [docker.io, docker-compose, docker-doc, podman-docker]
+    state: absent
+- ansible.builtin.file: { path: /etc/apt/keyrings, state: directory, mode: '0755' }
+- ansible.builtin.get_url:
+    url: "https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg"
+    dest: /etc/apt/keyrings/docker.asc
+    mode: '0644'
+- ansible.builtin.deb822_repository:
+    name: docker
+    types: deb
+    uris: "https://download.docker.com/linux/{{ ansible_distribution | lower }}"
+    suites: "{{ ansible_distribution_release }}"
+    components: stable
+    architectures: "{{ 'amd64' if ansible_architecture == 'x86_64' else 'arm64' }}"
+    signed_by: /etc/apt/keyrings/docker.asc
+    state: present
+    enabled: true
+- ansible.builtin.apt:
+    name: [docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin]
+    state: present
+    update_cache: true
+- ansible.builtin.apt: { name: python3-docker, state: present }     # SDK for community.docker
+
+# tasks/install_redhat.yml (key tasks)
+- ansible.builtin.dnf: { name: [docker, docker-client, docker-engine], state: absent }
+- ansible.builtin.rpm_key: { key: https://download.docker.com/linux/centos/gpg, state: present }
+- ansible.builtin.get_url:
+    url: https://download.docker.com/linux/centos/docker-ce.repo
+    dest: /etc/yum.repos.d/docker-ce.repo
+    mode: "0644"
+- ansible.builtin.dnf:
+    name: [docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin]
+    state: present
+    update_cache: true
+- ansible.builtin.dnf: { name: python3-pip, state: present }
+- ansible.builtin.pip: { name: docker, state: present }
+
+# ---- 9.6 roles/container_app (build image from Dockerfile + run container) ----
+- name: Create the build directory
+  ansible.builtin.file:
+    path: "/opt/docker/{{ app_name }}"
+    state: directory
+    mode: "0755"
+
+- name: Copy the Dockerfile to the host
+  ansible.builtin.copy:
+    src: "{{ app_dockerfile }}"             # roles/container_app/files/Dockerfile.apache
+    dest: "/opt/docker/{{ app_name }}/Dockerfile"
+    mode: "0644"
+  register: dockerfile_result
+
+- name: Build the image
+  community.docker.docker_image:
+    name: "{{ app_image }}"
+    tag: latest
+    source: build
+    build:
+      path: "/opt/docker/{{ app_name }}"
+      pull: true
+    force_source: "{{ dockerfile_result is changed }}"   # rebuild only if Dockerfile changed
+    state: present
+  register: image_result
+
+- name: Run the container
+  community.docker.docker_container:
+    name: "{{ app_name }}"
+    image: "{{ app_image }}:latest"
+    state: started
+    restart_policy: unless-stopped
+    published_ports: "{{ app_ports }}"        # ["8080:80"]
+    recreate: "{{ image_result is changed }}"
+
+- name: Open Firewall
+  ansible.posix.firewalld:
+    port: "{{ item.split(':')[0] }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ app_ports }}"
+  when: ansible_os_family == "RedHat"          # repo has "Redhat" (typo) -> never matches!
+
+# ---- 9.7 roles/prometheus (binary install pattern) ----
+# defaults/main.yml
+# prometheus_version: "2.52.0"
+# prometheus_user: prometheus
+# prometheus_group: prometheus
+# prometheus_config_dir: /etc/prometheus
+# prometheus_db_dir: /var/lib/prometheus
+# prometheus_bin_dir: /usr/local/bin
+# tasks flow: install wget/tar/curl (package) -> group (system) -> user (nologin) ->
+#   file (config dir, data dir) -> unarchive (remote_src, creates:) ->
+#   copy (remote_src: true, loop prometheus/promtool, mode 0755) ->
+#   copy prometheus.yml -> copy consoles dirs (loop) -> file recurse owner ->
+#   command promtool check config (changed_when: false) ->
+#   template prometheus.service.j2 (notify: Reload systemd, Restart prometheus) ->
+#   systemd enabled+started -> wait_for port 9090
+# templates/prometheus.service.j2:
+#   [Unit] Description=Prometheus  After=network-online.target
+#   [Service] User={{ prometheus_user }} Group={{ prometheus_group }} Type=simple Restart=on-failure
+#     ExecStart={{ prometheus_bin_dir }}/prometheus --config.file={{ prometheus_config_dir }}/prometheus.yml \
+#       --storage.tsdb.path={{ prometheus_db_dir }} --web.listen-address=0.0.0.0:9090
+#   [Install] WantedBy=multi-user.target
+# handlers: - name: Reload systemd -> systemd: {daemon_reload: true}
+#           - name: Restart prometheus -> systemd: {name: prometheus, state: restarted}
+
+# ---- 9.8 roles/elasticsearch ----
+# defaults/main.yml
+# es_cluster_name: elk-lab
+# es_node_name: "{{ ansible_hostname }}"
+# es_heap_size: 1g                      # Xms == Xmx
+# es_http_host: 0.0.0.0
+# es_http_port: 9200
+# es_http_publish_host: "{{ ansible_host }}"
+#
+# tasks/main.yml
+- ansible.builtin.include_tasks: "install_{{ ansible_os_family | lower }}.yml"
+- ansible.builtin.include_tasks: configure.yml
+- ansible.builtin.include_tasks: security.yml
+- ansible.builtin.include_tasks: firewall.yml
+
+# install_debian.yml: apt prereqs -> get_url GPG key -> command "gpg --dearmor -o <keyring> <key>"
+#   (args creates: keyring) -> apt_repository {repo: "{{ elastic_apt_repo }}", filename: elastic-9.x}
+#   -> apt install elasticsearch
+# install_redhat.yml: rpm_key -> yum_repository (gpgcheck: true, enabled: false) ->
+#   yum {name: elasticsearch, enablerepo: elasticsearch}
+
+# configure.yml
+- name: Set core settings in elasticsearch.yml
+  ansible.builtin.lineinfile:
+    path: /etc/elasticsearch/elasticsearch.yml
+    regexp: "^#?{{ item.key }}:"
+    line: "{{ item.key }}: {{ item.value }}"
+  loop:
+    - { key: "cluster.name", value: "{{ es_cluster_name }}" }
+    - { key: "node.name",    value: "{{ es_node_name }}" }
+    - { key: "http.host",    value: "{{ es_http_host }}" }
+    - { key: "http.port",    value: "{{ es_http_port }}" }
+  notify: Restart elasticsearch
+- name: Set JVM heap size
+  ansible.builtin.template:
+    src: heap.options.j2                  # -Xms{{ es_heap_size }}  /  -Xmx{{ es_heap_size }}
+    dest: /etc/elasticsearch/jvm.options.d/heap.options
+    owner: root
+    group: elasticsearch
+    mode: "0660"
+  notify: Restart elasticsearch
+- ansible.builtin.meta: flush_handlers
+
+# security.yml (idempotent password reset)
+- ansible.builtin.systemd: { name: elasticsearch, daemon_reload: true, enabled: true, state: started }
+- ansible.builtin.wait_for: { port: "{{ es_http_port }}", timeout: 180 }
+- name: Generate a temporary elastic password (first run only)
+  ansible.builtin.command: >
+    /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -a -b -s
+  args:
+    creates: /etc/elasticsearch/.elastic_password_set
+  register: es_temp_pw
+  retries: 6
+  delay: 10
+  until: es_temp_pw.rc == 0
+  no_log: "{{ es_no_log | default(true) }}"
+- name: Set the elastic password to the vaulted value
+  ansible.builtin.uri:
+    url: "https://localhost:{{ es_http_port }}/_security/user/elastic/_password"
+    method: POST
+    user: elastic
+    password: "{{ es_temp_pw.stdout_lines | last | trim }}"
+    force_basic_auth: true
+    body_format: json
+    body: { password: "{{ es_elastic_password }}" }
+    validate_certs: false
+    status_code: 200
+  when: es_temp_pw is changed
+  no_log: true
+- ansible.builtin.file: { path: /etc/elasticsearch/.elastic_password_set, state: touch, mode: "0600" }
+  when: es_temp_pw is changed
+# marker file (creates:) = "run once" trick
+
+# handlers/main.yml: - name: Restart elasticsearch / ansible.builtin.systemd: {name: elasticsearch, state: restarted}
+
+# ---- 9.9 roles/kibana ----
+# defaults: kibana_server_host: 0.0.0.0 | kibana_server_port: 5601
+#           kibana_server_name: "{{ ansible_hostname }}"
+#           kibana_public_url: "http://{{ ansible_host }}:{{ kibana_server_port }}"
+# tasks/main.yml: include_tasks install_<family>.yml -> configure.yml -> enroll.yml ->
+#   systemd (kibana started+enabled) -> wait_for port 5601
+# configure.yml: lineinfile loop on /etc/kibana/kibana.yml (server.port/host/name/publicBaseUrl)
+#   NOTE strings need inner quotes:  value: '"{{ kibana_server_host }}"'   notify: Restart kibana
+# enroll.yml (token pattern)
+- name: Check whether Kibana is already enrolled
+  ansible.builtin.command: grep -q '^elasticsearch.hosts' /etc/kibana/kibana.yml
+  register: kibana_enrolled
+  failed_when: kibana_enrolled.rc > 1
+  changed_when: false
+- name: Generate a Kibana enrollment token on the Elasticsearch host
+  ansible.builtin.command: >
+    /usr/share/elasticsearch/bin/elasticsearch-create-enrollment-token -s kibana
+  delegate_to: "{{ es_primary_host }}"      # runs on ES host, result stored for Kibana host
+  register: kibana_token
+  no_log: true
+  when: kibana_enrolled.rc == 1
+- name: Enroll Kibana using the token
+  ansible.builtin.command: >
+    /usr/share/kibana/bin/kibana-setup --enrollment-token {{ kibana_token.stdout }}
+  no_log: true
+  when: kibana_enrolled.rc == 1
+  notify: Restart kibana
+- ansible.builtin.file: { path: /etc/kibana/kibana.yml, owner: root, group: kibana, mode: "0660" }
+
+# ---- 9.10 roles/logstash ----
+# defaults: logstash_beats_port: 5044
+#           logstash_ca_path: /etc/logstash/certs/http_ca.crt
+#           logstash_index_pattern: "logstash-%{+YYYY.MM.dd}"
+# configure.yml
+- name: Read the Elasticsearch CA certificate from the ES host
+  ansible.builtin.slurp: { src: /etc/elasticsearch/certs/http_ca.crt }
+  delegate_to: "{{ es_primary_host }}"
+  register: es_ca
+- ansible.builtin.file: { path: /etc/logstash/certs, state: directory, owner: root, group: logstash, mode: "0750" }
+- ansible.builtin.copy:
+    content: "{{ es_ca.content | b64decode }}"      # move a file between hosts via control node
+    dest: "{{ logstash_ca_path }}"
+    owner: root
+    group: logstash
+    mode: "0640"
+  notify: Restart logstash
+- ansible.builtin.template:
+    src: beats-to-es.conf.j2
+    dest: /etc/logstash/conf.d/beats-to-es.conf
+    owner: root
+    group: logstash
+    mode: "0640"                           # contains a password
+  notify: Restart logstash
+# templates/beats-to-es.conf.j2:
+#   input  { beats { port => {{ logstash_beats_port }} } }
+#   output { elasticsearch {
+#     hosts => ["https://{{ es_primary_addr }}:9200"]
+#     user => "elastic"  password => "{{ es_elastic_password }}"
+#     ssl_certificate_authorities => ["{{ logstash_ca_path }}"]
+#     index => "{{ logstash_index_pattern }}" } }
+
+# ---- 9.11 Using roles in a play: 4 ways ----
+# roles:                                   # static, runs BEFORE tasks:
+#   - web
+#   - { role: db, tags: db }
+#   - role: elasticsearch
+#     vars: { es_heap_size: 2g }           # override defaults per use
+# tasks:
+#   - ansible.builtin.include_role: { name: web }    # dynamic (loops/when work)
+#   - ansible.builtin.import_role:  { name: web }    # static
+# meta/main.yml dependencies:               # auto-run another role first
+#   dependencies:
+#     - role: base
+# Roles path: roles_path in ansible.cfg (./roles) ; ansible-galaxy init to scaffold
+
+################################################################################
+# 10. DOCKER VIA ANSIBLE (community.docker) - MODULE REFERENCE
+################################################################################
+# Needs: collection community.docker (control node) + Docker SDK for Python (target):
+#   Ubuntu: python3-docker | CentOS: pip install docker
+---
+- name: docker modules
+  hosts: web_servers
+  become: true
+  tasks:
+    - name: Pull image
+      community.docker.docker_image:
+        name: nginx
+        tag: latest
+        source: pull
+
+    - name: Build image
+      community.docker.docker_image:
+        name: myapp
+        tag: v1
+        source: build
+        build: { path: /opt/myapp, pull: true }
+
+    - name: Network + volume
+      community.docker.docker_network: { name: appnet, state: present }
+    - community.docker.docker_volume: { name: dbdata }
+
+    - name: Run container (all common options)
+      community.docker.docker_container:
+        name: web
+        image: nginx:latest
+        state: started                    # started|stopped|absent|present
+        restart_policy: unless-stopped    # no|always|on-failure|unless-stopped
+        published_ports: ["8080:80"]      # (alias: ports)
+        env: { APP_ENV: production }
+        volumes: ["/opt/site:/usr/share/nginx/html:ro", "dbdata:/var/lib/mysql"]
+        networks: [{ name: appnet }]
+        command: ["nginx", "-g", "daemon off;"]
+        recreate: false                   # true = force replace
+
+    - name: Remove container
+      community.docker.docker_container: { name: web, state: absent }
+
+    - name: Compose v2
+      community.docker.docker_compose_v2:
+        project_src: /opt/myapp
+        state: present                    # present = up -d ; absent = down
+
+    - name: Info
+      community.docker.docker_container_info: { name: web }
+      register: web_info                  # web_info.container.State.Running
+
+    - name: docker_image state: absent (remove) / docker_prune / docker_login / docker_image_info
+      community.docker.docker_image: { name: nginx, state: absent }
+
+################################################################################
+# 11. DOCKER CHEAT SHEET (plain CLI) + YOUR DOCKERFILES
+################################################################################
+# docker --version | docker info
+# docker pull nginx:latest ; docker images ; docker rmi <img>
+# docker build -t custom-apache:latest .          # Dockerfile in cwd ; -f Dockerfile.apache to pick file
+# docker run -d --name web -p 8080:80 custom-apache
+#   -d detach | -p host:container | -e K=V | -v host:ctr | --network n | --restart unless-stopped | --rm | -it
+# docker ps ; docker ps -a
+# docker exec -it web bash        # shell inside
+# docker exec db mariadb -e "SELECT 1"       # one-off command (YOUR post_task)
+# docker logs -f web ; docker inspect web ; docker stats ; docker top web
+# docker stop|start|restart web ; docker rm -f web
+# docker cp file web:/tmp/ ; docker cp web:/tmp/file .
+# docker network create appnet|ls|inspect ; docker volume create|ls|inspect
+# docker system prune -a            # remove unused images/containers/networks
+# docker compose up -d | down | ps | logs | build
+# docker tag img user/img:v1 ; docker push user/img:v1 ; docker login
+#
+# --- YOUR Dockerfile.apache ---
+# FROM ubuntu:24.04
+# ENV DEBIAN_FRONTEND=noninteractive
+# RUN apt-get update \
+#     && apt-get install -y --no-install-recommends apache2 \
+#     && rm -rf /var/lib/apt/lists/*
+# EXPOSE 80
+# CMD ["apache2ctl", "-D", "FOREGROUND"]       # must run in FOREGROUND or container exits
+#
+# --- YOUR Dockerfile.mariadb ---
+# FROM ubuntu:24.04
+# ENV DEBIAN_FRONTEND=noninteractive
+# RUN apt-get update \
+#     && apt-get install -y --no-install-recommends mariadb-server \
+#     && rm -rf /var/lib/apt/lists/* \
+#     && sed -i 's/^bind-address.*/bind-address = 0.0.0.0/' /etc/mysql/mariadb.conf.d/50-server.cnf \
+#     && mkdir -p /run/mysqld \
+#     && chown mysql:mysql /run/mysqld
+# EXPOSE 3306
+# CMD ["mariadbd", "--user=mysql"]
+#
+# Dockerfile instructions: FROM base | RUN (build time) | CMD (default run cmd, overridable)
+#   | ENTRYPOINT (fixed exe) | COPY (local->image) | ADD (COPY + untar + URL) | ENV | WORKDIR
+#   | EXPOSE (documents port; -p publishes) | VOLUME | USER | LABEL | ARG (build-time var)
+# Concepts: Image = read-only template ; Container = running instance ; Volume = persistent data ;
+#   Registry = image store (Docker Hub) ; containers share host kernel (VMs have own OS).
+# Why "&& rm -rf /var/lib/apt/lists/*" ? smaller layers. Why one RUN? fewer layers.
+#
+# docker-compose.yml example:
+# services:
+#   web:
+#     image: custom-apache
+#     ports: ["8080:80"]
+#     depends_on: [db]
+#   db:
+#     image: custom-mariadb
+#     ports: ["3306:3306"]
+#     volumes: ["dbdata:/var/lib/mysql"]
+# volumes:
+#   dbdata:
+
+################################################################################
+# 12. EXTRA MODULES (quick forms, likely exam asks)
+################################################################################
+# - name: Install LAMP bits          ansible.builtin.package: {name: [apache2, php], state: present}
+# - name: Samba share config         ansible.builtin.lineinfile / template -> /etc/samba/smb.conf ; notify restart smb
+# - name: NFS mount                  ansible.posix.mount: {path: /mnt/share, src: 10.0.0.5:/srv, fstype: nfs, state: mounted}
+# - name: MariaDB db/user            community.mysql.mysql_db / mysql_user (needs python3-pymysql)
+# - name: Set hostname               ansible.builtin.hostname: {name: "{{ inventory_hostname }}"}
+# - name: Timezone                   community.general.timezone: {name: Asia/Manila}
+# - name: Enable repo (CentOS)       ansible.builtin.dnf: {name: epel-release, state: present}
+# - name: Sudoers drop-in            ansible.builtin.copy: {content: "u ALL=(ALL) NOPASSWD:ALL\n", dest: /etc/sudoers.d/u, mode: '0440', validate: 'visudo -cf %s'}
+# - name: Strategy / rolling         serial: 1 | max_fail_percentage: 0 | any_errors_fatal: true | strategy: free
+# - name: async long task            async: 60 ; poll: 0 ; register: job ; then ansible.builtin.async_status
+# - name: Check mode aware           check_mode: no (runs even with --check)
+# - name: Run on control node        delegate_to: localhost  (or hosts: localhost + connection: local)
+
+################################################################################
+# 13. EXAM TIPS + DEBUGGING
+################################################################################
+# CONCEPTS
+# - Agentless, push-based, SSH (Linux) / WinRM (Windows), YAML, needs Python on target (raw bootstraps it).
+# - Idempotent: 2nd run shows changed=0. command/shell are NOT idempotent -> add creates:/removes:/changed_when.
+# - Play = hosts+tasks ; Playbook = list of plays ; Task = module call ; Role = reusable bundle.
+# - Handlers: run once at end, only if a task reported "changed". meta: flush_handlers forces earlier.
+# - become: true -> sudo. become_user: other user. become_ask_pass in cfg -> -K equivalent.
+# - FQCN (ansible.builtin.copy) preferred; short names (copy, apt) work too.
+# - include_* = dynamic (evaluated at runtime) ; import_* = static (parsed up front).
+# - Facts: gathered by setup module at play start; use ansible_* ; disable with gather_facts: false.
+# - -e (extra vars) beats everything; role defaults are weakest.
+# - Dynamic inventory = scripts/plugins (cloud) ; static = INI/YAML.
+#
+# FAMILY DIFFERENCES (memorize)
+#   Debian/Ubuntu: apt, ufw, ssh service, apache2, www-data, /etc/apt, user group "sudo", python3-docker
+#   RedHat/CentOS: dnf/yum, firewalld, sshd service, httpd, apache,  /etc/yum.repos.d, group "wheel", SELinux
+#   os_family values are "Debian" / "RedHat" (exact case) ; ansible_distribution "Ubuntu" / "CentOS"
+#
+# YAML GOTCHAS
+#   - Spaces only, consistent indent (2). Module args must be INDENTED UNDER the module name.
+#   - Quote anything starting with {{ :  msg: "{{ var }}"  ;  quote modes: mode: '0644'
+#   - No {{ }} inside when:  (it is already Jinja)
+#   - YAML true/false/yes/no are booleans ; "yes" string needs quotes if literal.
+#   - A role's tasks/main.yml is a plain list (no "tasks:" header).
+#
+# TROUBLESHOOTING
+#   UNREACHABLE            -> wrong ansible_host/ansible_user, SSH not running, ssh-copy-id missing
+#   Permission denied      -> missing become: true / wrong sudo password (-K)
+#   "module not found"     -> collection missing: ansible-galaxy collection install ansible.posix community.general community.docker
+#   Docker modules fail    -> Docker SDK (python3-docker / pip docker) not installed on target
+#   undefined variable     -> check group_vars file name = group name ; use | default()
+#   task skipped           -> when: condition false (check case: "RedHat" vs "Redhat", "CentOS" vs "centos")
+#   always "changed"       -> command/shell without creates: or changed_when: false
+#   handler didn't run     -> task not changed, or name mismatch in notify
+#   vault error            -> forgot --ask-vault-pass / wrong password
+#   Debug aids             -> -vvv, debug: var=..., --check --diff, --syntax-check, --list-tasks, ansible-lint
+#
+# EXAM WORKFLOW
+#   1) write inventory/group  2) ansible all -m ping  3) --syntax-check  4) --check --diff
+#   5) run  6) run again (expect changed=0)  7) verify (uri / wait_for / docker ps / curl)
+
+# username@hostname
+# username ALL=(ALL:ALL) NOPASSWD: ALL

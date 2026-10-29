@@ -1,0 +1,57 @@
+# HOME INVENTORY FILE
+all:
+  children:
+    ubuntu:
+      hosts:
+        ubuntu1:
+          ansible_host: 192.168.56.102
+          ansible_user: server1
+        
+        ubuntu2:
+          ansible_host: 192.168.56.103
+          ansible_user: server2
+
+    centos:
+      hosts:
+        centos1:
+          ansible_host: 192.168.56.104
+          ansible_user: santiago
+    
+    redhat:
+      vars:
+        apache_package: httpd
+        php_package: php
+    
+    web_servers:
+      hosts:
+        ubuntu1:
+          ansible_host: 192.168.56.102
+          ansible_user: server1
+        centos1:
+          ansible_host: 192.168.56.104
+          ansible_user: santiago
+
+    
+    db_servers:
+      hosts:
+        ubuntu2:
+          ansible_host: 192.168.56.103
+          ansible_user: server2
+    
+    file_servers:
+      hosts:
+        centos1:
+          ansible_host: 192.168.56.104
+          ansible_user: santiago
+
+    workstations:
+      hosts:
+        ubuntu1:
+          ansible_host: 192.168.56.102
+          ansible_user: server1
+ 
+    linuxservers:
+      children:
+        ubuntu:
+        centos:
+        redhat:

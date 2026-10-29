@@ -1,0 +1,74 @@
+# First, set SELinux to permissive mode.
+
+sudo sed -i 's/SELINUX=.*/SELINUX=permissive/g' /etc/selinux/config
+sudo setenforce 0
+
+
+# OPEN HTTP AND HTTPS PORTS AND RELOAD FIREWALL
+sudo firewall-cmd --zone=public --add-service=http --permanent
+sudo firewall-cmd --zone=public --add-service=https --permanent
+sudo firewall-cmd --reload
+
+# Install the prerequisite packages for the Nagios installation:
+
+sudo dnf install gcc glibc glibc-common make gettext automake autoconf gd gd-devel perl net-snmp net-snmp-utils openssl-devel epel-release wget tar
+sudo dnf --enablerepo=powertools,epel install perl-Net-SNMP
+
+# Install and Start Apache
+sudo dnf install httpd
+sudo systemctl start httpd
+sudo systemctl enable httpd
+
+# Install PHP
+sudo dnf install php php-cli
+
+# Download Nagios
+cd /tmp
+curl -s https://api.github.com/repos/NagiosEnterprises/nagioscore/releases/latest \
+| grep "browser_download_url.*nagios.*.tar.gz\"" \
+| tail -n 1 \
+| cut -d : -f 2,3 \
+| tr -d \" \
+| wget -O nagios-core.tar.gz -qi -
+curl -s https://api.github.com/repos/nagios-plugins/nagios-plugins/releases/latest \
+| grep "browser_download_url.*nagios-plugins.*.tar.gz\"" \
+| tail -n 1 \
+| cut -d : -f 2,3 \
+| tr -d \" \
+| wget -O nagios-plugins.tar.gz -qi -
+tar xzvf nagios-core.tar.gz
+tar xzvf nagios-plugins.tar.gz
+
+# Change into the Nagios Core Directory 
+cd nagios-4.*/
+
+# Compile Nagios Source Files
+sudo ./configure
+sudo make all
+
+# Create the Nagios user and user group and add the apache group to the nagios user:
+sudo make install-groups-users
+sudo usermod -aG nagios apache
+
+# Install compiled Files
+sudo make install
+
+# Install the Nagios service, command mode, and default configurations.
+sudo make install-daemoninit
+sudo make install-commandmode
+sudo make install-config
+sudo make install-webconf
+sudo systemctl restart httpd
+
+# Add the nagiosadmin user account via htpasswd
+sudo htpasswd -c /usr/local/nagios/etc/htpasswd.users nagiosadmin
+
+# Start and enable Nagios
+sudo systemctl start nagios
+sudo systemctl enable nagios
+
+# Compile and install the Nagios plugins:
+cd /tmp/nagios-plugins-*/
+sudo ./configure
+sudo make
+sudo make install
