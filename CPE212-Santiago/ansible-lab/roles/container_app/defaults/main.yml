@@ -1,0 +1,6 @@
+---
+# defaults file for roles/container_app
+app_extra_files: []        # extra files copied next to the Dockerfile (build context)
+app_env: {}                # environment variables for the container
+app_volumes: []            # e.g. ["prometheus_data:/prometheus"]
+app_build_timeout: 900     # Nagios compiles from source; allow time

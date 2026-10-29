@@ -1,0 +1,64 @@
+---
+# tasks file for roles/container_app
+- name: Create the build directory
+  ansible.builtin.file:
+    path: "/opt/docker/{{ app_name }}"
+    state: directory
+    mode: "0755"
+
+- name: Copy the Dockerfile to the host
+  ansible.builtin.copy:
+    src: "{{ app_dockerfile }}"
+    dest: "/opt/docker/{{ app_name }}/Dockerfile"
+    mode: "0644"
+  register: dockerfile_result
+
+- name: Copy extra build-context files (entrypoint, configs)
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/opt/docker/{{ app_name }}/{{ item }}"
+    mode: "0644"
+  loop: "{{ app_extra_files }}"
+  register: extra_files_result
+
+- name: Build the image
+  community.docker.docker_image:
+    name: "{{ app_image }}"
+    tag: latest
+    source: build
+    build:
+      path: "/opt/docker/{{ app_name }}"
+      pull: true
+    force_source: "{{ dockerfile_result is changed or extra_files_result is changed }}"
+    timeout: "{{ app_build_timeout }}"
+    state: present
+  register: image_result
+
+- name: Run the container
+  community.docker.docker_container:
+    name: "{{ app_name }}"
+    image: "{{ app_image }}:latest"
+    state: started
+    restart_policy: unless-stopped
+    published_ports: "{{ app_ports }}"
+    env: "{{ app_env }}"
+    volumes: "{{ app_volumes }}"
+    recreate: "{{ image_result is changed }}"
+  no_log: "{{ app_no_log | default(true) }}"     # env may hold a password
+
+- name: Open firewall (firewalld - CentOS)
+  ansible.posix.firewalld:
+    port: "{{ item.split(':')[0] }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ app_ports }}"
+  when: ansible_os_family == "RedHat"
+
+- name: Open firewall (ufw - Ubuntu)
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.split(':')[0] }}"
+    proto: tcp
+  loop: "{{ app_ports }}"
+  when: ansible_os_family == "Debian" 
