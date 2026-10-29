@@ -1,0 +1,565 @@
+================================================================================
+ NAGIOS + PROMETHEUS, EACH IN ITS OWN CONTAINER, ON ubuntu1 AND centos1
+ NEW EXAM REPOSITORY - SELF-CONTAINED (only the lab inventory is reused)
+================================================================================
+
+WHAT YOU END UP WITH (on EACH of ubuntu1 and centos1)
+  - Docker Engine installed by Ansible (role: docker)
+  - Container "nagios"     (image custom-nagios)     -> http://<host-ip>:8081/nagios/
+  - Container "prometheus" (image custom-prometheus) -> http://<host-ip>:9090
+  Nagios uses host port 8081 so it never clashes with anything on port 80.
+
+HOW IT WORKS
+  One reusable role (container_app) builds an image from a Dockerfile and runs it.
+  The playbook calls that role twice with different variables:
+  once for Nagios, once for Prometheus.
+
+TARGET LAYOUT OF THE NEW REPO
+  exam-repo/
+  |-- ansible.cfg
+  |-- lab_inventory.yml                 (your existing lab inventory, unchanged)
+  |-- deploy_monitoring.yml             (the playbook)
+  |-- group_vars/all/vault.yml          (encrypted: Nagios web password)
+  `-- roles/
+      |-- docker/
+      |   `-- tasks/{main.yml, install_debian.yml, install_redhat.yml}
+      `-- container_app/
+          |-- defaults/main.yml
+          |-- tasks/main.yml
+          `-- files/{Dockerfile.nagios, nagios-entrypoint.sh,
+                     Dockerfile.prometheus, prometheus.yml}
+
+
+--------------------------------------------------------------------------------
+STEP 1. PREREQUISITES (control node)
+--------------------------------------------------------------------------------
+  cd exam-repo
+  ansible --version
+  ansible-galaxy collection install community.docker ansible.posix community.general
+
+Both VMs need internet access (Docker repo, Docker Hub, GitHub for Nagios source).
+
+
+--------------------------------------------------------------------------------
+STEP 2. ansible.cfg   (create in repo root)
+--------------------------------------------------------------------------------
+[defaults]
+roles_path = ./roles
+inventory = lab_inventory.yml
+deprecation_warnings = False
+
+[privilege_escalation]
+become = True
+become_method = sudo
+become_user = root
+become_ask_pass = True
+
+[ssh_connection]
+pipelining = True
+
+
+--------------------------------------------------------------------------------
+STEP 3. INVENTORY - copy your lab_inventory.yml into the repo root
+--------------------------------------------------------------------------------
+It must contain at least these groups (yours already does):
+
+  web_servers: ubuntu1 (192.168.56.114, user server1)
+               centos1 (192.168.56.118, user santiago)
+
+Test it:
+  ansible-inventory --graph
+  ansible web_servers -m ping          # both hosts must answer "pong"
+
+(The playbook targets web_servers, so ubuntu1 AND centos1 are both covered.)
+
+
+--------------------------------------------------------------------------------
+STEP 4. CREATE THE ROLE SKELETONS
+--------------------------------------------------------------------------------
+  ansible-galaxy init roles/docker
+  ansible-galaxy init roles/container_app
+  mkdir -p group_vars/all
+
+
+--------------------------------------------------------------------------------
+STEP 5. roles/docker/tasks/main.yml
+--------------------------------------------------------------------------------
+---
+- name: Install Docker (OS-specific tasks)
+  ansible.builtin.include_tasks: "install_{{ ansible_os_family | lower }}.yml"
+
+- name: Enable and start Docker and its socket
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+  loop:
+    - docker.service
+    - docker.socket
+
+- name: Add the connecting user to the docker group
+  ansible.builtin.user:
+    name: "{{ ansible_user | default(lookup('env', 'USER')) }}"
+    groups: docker
+    append: true
+
+- name: Apply the new group membership
+  ansible.builtin.meta: reset_connection
+
+
+--------------------------------------------------------------------------------
+STEP 6. roles/docker/tasks/install_debian.yml   (Ubuntu)
+--------------------------------------------------------------------------------
+---
+- name: Install prerequisites
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - python3-debian          # required by deb822_repository
+    state: present
+    update_cache: true
+
+- name: Remove old/conflicting Docker packages
+  ansible.builtin.apt:
+    name:
+      - docker.io
+      - docker-compose
+      - docker-compose-v2
+      - docker-doc
+      - podman-docker
+    state: absent
+
+- name: Create the apt keyrings directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Import the Docker GPG key
+  ansible.builtin.get_url:
+    url: "https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg"
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+
+- name: Add the Docker repository
+  ansible.builtin.deb822_repository:
+    name: docker
+    types: deb
+    uris: "https://download.docker.com/linux/{{ ansible_distribution | lower }}"
+    suites: "{{ ansible_distribution_release }}"
+    components: stable
+    architectures: "{{ 'amd64' if ansible_architecture == 'x86_64' else 'arm64' }}"
+    signed_by: /etc/apt/keyrings/docker.asc
+    state: present
+    enabled: true
+
+- name: Install the Docker packages
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+    update_cache: true
+
+- name: Install the Docker SDK for Python
+  ansible.builtin.apt:
+    name: python3-docker
+    state: present
+
+
+--------------------------------------------------------------------------------
+STEP 7. roles/docker/tasks/install_redhat.yml   (CentOS)
+--------------------------------------------------------------------------------
+---
+- name: Remove old/conflicting Docker packages
+  ansible.builtin.dnf:
+    name:
+      - docker
+      - docker-client
+      - docker-client-latest
+      - docker-common
+      - docker-latest
+      - docker-logrotate
+      - docker-engine
+    state: absent
+
+- name: Import the Docker GPG key
+  ansible.builtin.rpm_key:
+    key: https://download.docker.com/linux/centos/gpg
+    state: present
+
+- name: Add the Docker repository
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/centos/docker-ce.repo
+    dest: /etc/yum.repos.d/docker-ce.repo
+    mode: "0644"
+
+- name: Install the Docker packages
+  ansible.builtin.dnf:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+    update_cache: true
+
+- name: Install pip
+  ansible.builtin.dnf:
+    name: python3-pip
+    state: present
+
+- name: Install the Docker SDK for Python
+  ansible.builtin.pip:
+    name: docker
+    state: present
+
+
+--------------------------------------------------------------------------------
+STEP 8. roles/container_app/defaults/main.yml
+--------------------------------------------------------------------------------
+---
+app_extra_files: []        # extra files copied next to the Dockerfile (build context)
+app_env: {}                # environment variables for the container
+app_volumes: []            # e.g. ["prometheus_data:/prometheus"]
+app_build_timeout: 900     # Nagios compiles from source; allow time
+
+
+--------------------------------------------------------------------------------
+STEP 9. roles/container_app/tasks/main.yml
+--------------------------------------------------------------------------------
+---
+- name: Create the build directory
+  ansible.builtin.file:
+    path: "/opt/docker/{{ app_name }}"
+    state: directory
+    mode: "0755"
+
+- name: Copy the Dockerfile to the host
+  ansible.builtin.copy:
+    src: "{{ app_dockerfile }}"
+    dest: "/opt/docker/{{ app_name }}/Dockerfile"
+    mode: "0644"
+  register: dockerfile_result
+
+- name: Copy extra build-context files (entrypoint, configs)
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/opt/docker/{{ app_name }}/{{ item }}"
+    mode: "0644"
+  loop: "{{ app_extra_files }}"
+  register: extra_files_result
+
+- name: Build the image
+  community.docker.docker_image:
+    name: "{{ app_image }}"
+    tag: latest
+    source: build
+    build:
+      path: "/opt/docker/{{ app_name }}"
+      pull: true
+    force_source: "{{ dockerfile_result is changed or extra_files_result is changed }}"
+    timeout: "{{ app_build_timeout }}"
+    state: present
+  register: image_result
+
+- name: Run the container
+  community.docker.docker_container:
+    name: "{{ app_name }}"
+    image: "{{ app_image }}:latest"
+    state: started
+    restart_policy: unless-stopped
+    published_ports: "{{ app_ports }}"
+    env: "{{ app_env }}"
+    volumes: "{{ app_volumes }}"
+    recreate: "{{ image_result is changed }}"
+  no_log: "{{ app_no_log | default(true) }}"     # env may hold a password
+
+- name: Open firewall (firewalld - CentOS)
+  ansible.posix.firewalld:
+    port: "{{ item.split(':')[0] }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ app_ports }}"
+  when: ansible_os_family == "RedHat"            # exact case: "RedHat"
+
+- name: Open firewall (ufw - Ubuntu)
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.split(':')[0] }}"
+    proto: tcp
+  loop: "{{ app_ports }}"
+  when: ansible_os_family == "Debian"            # delete this task if ufw is not installed
+
+
+--------------------------------------------------------------------------------
+STEP 10. roles/container_app/files/Dockerfile.nagios
+--------------------------------------------------------------------------------
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ARG NAGIOS_VERSION=4.4.14
+ARG PLUGINS_VERSION=2.4.8
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       autoconf gcc libc6 make wget unzip apache2 apache2-utils php libapache2-mod-php \
+       libgd-dev openssl libssl-dev build-essential libmcrypt-dev bc gawk dc snmp \
+       libnet-snmp-perl gettext iputils-ping ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Nagios Core
+RUN cd /tmp \
+    && wget -q https://github.com/NagiosEnterprises/nagioscore/releases/download/nagios-${NAGIOS_VERSION}/nagios-${NAGIOS_VERSION}.tar.gz \
+    && tar xzf nagios-${NAGIOS_VERSION}.tar.gz \
+    && cd nagios-${NAGIOS_VERSION} \
+    && ./configure --with-httpd-conf=/etc/apache2/sites-enabled \
+    && make all \
+    && make install-groups-users \
+    && usermod -a -G nagios www-data \
+    && make install \
+    && make install-commandmode \
+    && make install-config \
+    && make install-webconf \
+    && a2enmod rewrite cgi \
+    && cd /tmp && rm -rf nagios-${NAGIOS_VERSION}*
+
+# Nagios Plugins
+RUN cd /tmp \
+    && wget -q https://github.com/nagios-plugins/nagios-plugins/releases/download/release-${PLUGINS_VERSION}/nagios-plugins-${PLUGINS_VERSION}.tar.gz \
+    && tar xzf nagios-plugins-${PLUGINS_VERSION}.tar.gz \
+    && cd nagios-plugins-${PLUGINS_VERSION} \
+    && ./configure \
+    && make \
+    && make install \
+    && cd /tmp && rm -rf nagios-plugins-${PLUGINS_VERSION}*
+
+RUN echo "ServerName localhost" > /etc/apache2/conf-available/servername.conf \
+    && a2enconf servername
+
+COPY nagios-entrypoint.sh /usr/local/bin/nagios-entrypoint.sh
+RUN chmod +x /usr/local/bin/nagios-entrypoint.sh
+
+EXPOSE 80
+ENTRYPOINT ["/usr/local/bin/nagios-entrypoint.sh"]
+
+
+--------------------------------------------------------------------------------
+STEP 11. roles/container_app/files/nagios-entrypoint.sh
+--------------------------------------------------------------------------------
+#!/bin/bash
+# Creates the web login at start-up (password comes from the NAGIOS_PASS env var,
+# so it is NOT baked into the image), then starts Nagios + Apache.
+set -e
+
+htpasswd -b -c /usr/local/nagios/etc/htpasswd.users \
+  "${NAGIOS_USER:-nagiosadmin}" "${NAGIOS_PASS:?NAGIOS_PASS is not set}"
+
+/usr/local/nagios/bin/nagios -v /usr/local/nagios/etc/nagios.cfg   # validate config
+/usr/local/nagios/bin/nagios -d /usr/local/nagios/etc/nagios.cfg   # run daemon
+
+exec apache2ctl -D FOREGROUND        # keeps the container alive (PID 1)
+
+
+--------------------------------------------------------------------------------
+STEP 12. roles/container_app/files/Dockerfile.prometheus
+--------------------------------------------------------------------------------
+FROM prom/prometheus:v2.52.0
+COPY prometheus.yml /etc/prometheus/prometheus.yml
+EXPOSE 9090
+
+
+--------------------------------------------------------------------------------
+STEP 13. roles/container_app/files/prometheus.yml
+--------------------------------------------------------------------------------
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+
+--------------------------------------------------------------------------------
+STEP 14. CREATE THE VAULT (stores the Nagios web password)
+--------------------------------------------------------------------------------
+  ansible-vault create group_vars/all/vault.yml
+
+In the editor that opens, type (choose your own password), then save:
+
+  ---
+  vault_nagios_password: "ChangeMe-Nagios-123"
+
+(You will be asked to choose a vault password. Remember it: you type it with
+ --ask-vault-pass every time you run the playbook.)
+
+
+--------------------------------------------------------------------------------
+STEP 15. deploy_monitoring.yml   (repo root)
+--------------------------------------------------------------------------------
+---
+- name: Install Docker, then run Nagios and Prometheus in their own containers
+  hosts: web_servers                      # ubuntu1 + centos1
+  become: true
+
+  pre_tasks:
+    - name: Update apt cache (Ubuntu)
+      ansible.builtin.apt:
+        update_cache: true
+      when: ansible_os_family == "Debian"
+
+    - name: Update dnf cache (CentOS)
+      ansible.builtin.dnf:
+        update_cache: true
+      when: ansible_os_family == "RedHat"
+
+  roles:
+    - role: docker
+      tags: docker
+
+    - role: container_app                 # ---- Nagios container ----
+      vars:
+        app_name: nagios
+        app_image: custom-nagios
+        app_dockerfile: Dockerfile.nagios
+        app_extra_files:
+          - nagios-entrypoint.sh
+        app_ports:
+          - "8081:80"
+        app_env:
+          NAGIOS_USER: nagiosadmin
+          NAGIOS_PASS: "{{ vault_nagios_password }}"
+      tags: nagios
+
+    - role: container_app                 # ---- Prometheus container ----
+      vars:
+        app_name: prometheus
+        app_image: custom-prometheus
+        app_dockerfile: Dockerfile.prometheus
+        app_extra_files:
+          - prometheus.yml
+        app_ports:
+          - "9090:9090"
+        app_volumes:
+          - "prometheus_data:/prometheus"
+      tags: prometheus
+
+  post_tasks:
+    - name: Check that Nagios responds
+      ansible.builtin.uri:
+        url: "http://localhost:8081/nagios/"
+        user: nagiosadmin
+        password: "{{ vault_nagios_password }}"
+        force_basic_auth: true
+        status_code: 200
+      register: nagios_check
+      retries: 10
+      delay: 6
+      until: nagios_check.status == 200
+      no_log: true
+      tags: nagios
+
+    - name: Check that Prometheus is ready
+      ansible.builtin.uri:
+        url: "http://localhost:9090/-/ready"
+        status_code: 200
+      register: prom_check
+      retries: 10
+      delay: 5
+      until: prom_check.status == 200
+      tags: prometheus
+
+
+--------------------------------------------------------------------------------
+STEP 16. RUN IT
+--------------------------------------------------------------------------------
+  ansible-playbook deploy_monitoring.yml --syntax-check
+  ansible-playbook deploy_monitoring.yml --list-tasks
+  ansible-playbook deploy_monitoring.yml --ask-vault-pass
+
+(become_ask_pass = True, so you are also asked for the sudo password. The first
+ run takes several minutes: Docker install + compiling Nagios inside the image.)
+
+Run only part of it:
+  ansible-playbook deploy_monitoring.yml -t docker --ask-vault-pass
+  ansible-playbook deploy_monitoring.yml -t nagios --ask-vault-pass
+  ansible-playbook deploy_monitoring.yml -t prometheus --ask-vault-pass
+  ansible-playbook deploy_monitoring.yml -l ubuntu1 --ask-vault-pass     # one host only
+
+Run it a SECOND time: it should report changed=0 (idempotency check).
+Note: "-t nagios" or "-t prometheus" alone assumes Docker is already installed.
+
+
+--------------------------------------------------------------------------------
+STEP 17. VERIFY
+--------------------------------------------------------------------------------
+  ansible web_servers -b -m command -a "docker ps"
+      -> two containers per host: nagios and prometheus (STATUS Up)
+
+  Browser (lab IPs: ubuntu1 = 192.168.56.114, centos1 = 192.168.56.118):
+    http://192.168.56.114:8081/nagios/    login: nagiosadmin / <vault_nagios_password>
+    http://192.168.56.118:8081/nagios/
+    http://192.168.56.114:9090            (Status > Targets: "prometheus" should be UP)
+    http://192.168.56.118:9090
+
+  Logs if something is wrong:
+    ansible web_servers -b -m command -a "docker logs nagios"
+    ansible web_servers -b -m command -a "docker logs prometheus"
+
+
+--------------------------------------------------------------------------------
+STEP 18. TROUBLESHOOTING
+--------------------------------------------------------------------------------
+  docker_image / docker_container module errors
+      -> Docker SDK missing on the target; re-run with -t docker.
+  "community.docker not found"
+      -> ansible-galaxy collection install community.docker (control node).
+  deb822_repository fails on Ubuntu
+      -> python3-debian missing; it is installed in install_debian.yml, re-run -t docker.
+  Permission denied on /var/run/docker.sock
+      -> re-run the playbook (group change needs a fresh connection). Tasks use become.
+  Build very slow / times out
+      -> raise app_build_timeout in roles/container_app/defaults/main.yml.
+  Nagios container exits immediately
+      -> docker logs nagios. Usually NAGIOS_PASS missing (vault var) or a config error.
+  Port already in use
+      -> change the host side of app_ports, e.g. "8082:80" (host:container).
+  Page unreachable on CentOS
+      -> ansible centos1 -b -m command -a "firewall-cmd --list-ports"
+  Page unreachable on Ubuntu
+      -> ansible ubuntu1 -b -m command -a "ufw status"
+  Vault error
+      -> use --ask-vault-pass and check vault_nagios_password exists in group_vars/all/vault.yml.
+
+
+--------------------------------------------------------------------------------
+STEP 19. OPTIONAL CLEAN-UP
+--------------------------------------------------------------------------------
+  ansible web_servers -b -m community.docker.docker_container -a "name=nagios state=absent"
+  ansible web_servers -b -m community.docker.docker_container -a "name=prometheus state=absent"
+  ansible web_servers -b -m community.docker.docker_image -a "name=custom-nagios state=absent"
+  ansible web_servers -b -m community.docker.docker_image -a "name=custom-prometheus state=absent"
+
+
+--------------------------------------------------------------------------------
+WHAT THIS DEMONSTRATES (exam talking points)
+--------------------------------------------------------------------------------
+  - Inventory groups (web_servers) select ubuntu1 + centos1 in one play
+  - Roles: docker (OS split with include_tasks) and a reusable container_app
+  - Role parameters: the same role used twice with different vars
+  - ansible_os_family conditionals: apt/dnf, ufw/firewalld
+  - Dockerfile + entrypoint copied to /opt/docker/<app_name>/ and built on the host
+  - community.docker modules: docker_image (build), docker_container (run)
+  - ansible-vault: secret kept out of the playbook, passed in with env
+  - post_tasks + uri with retries/until: verification
+  - tags: -t docker / nagios / prometheus
+  - Idempotency: image rebuilt/container recreated only when something changed
+================================================================================
+
