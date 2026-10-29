@@ -1,0 +1,45 @@
+---
+- name: Remove old/conflicting Docker packages
+  ansible.builtin.dnf:
+    name:
+      - docker
+      - docker-client
+      - docker-client-latest
+      - docker-common
+      - docker-latest
+      - docker-logrotate
+      - docker-engine
+    state: absent
+
+- name: Import the Docker GPG key
+  ansible.builtin.rpm_key:
+    key: https://download.docker.com/linux/centos/gpg
+    state: present
+
+- name: Add the Docker repository
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/centos/docker-ce.repo
+    dest: /etc/yum.repos.d/docker-ce.repo
+    mode: "0644"
+
+- name: Install the Docker packages
+  ansible.builtin.dnf:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+    update_cache: true
+
+- name: Install pip
+  ansible.builtin.dnf:
+    name: python3-pip
+    state: present
+
+- name: Install the Docker SDK for Python
+  ansible.builtin.pip:
+    name: docker
+    state: present
+

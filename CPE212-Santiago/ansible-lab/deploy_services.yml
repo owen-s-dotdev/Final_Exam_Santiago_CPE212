@@ -1,0 +1,71 @@
+---
+- name: Install Docker, then run Nagios and Prometheus in their own containers
+  hosts: web_servers                      # ubuntu1 + centos1
+  become: true
+
+  pre_tasks:
+    - name: Update apt cache (Ubuntu)
+      ansible.builtin.apt:
+        update_cache: true
+      when: ansible_os_family == "Debian"
+
+    - name: Update dnf cache (CentOS)
+      ansible.builtin.dnf:
+        update_cache: true
+      when: ansible_os_family == "RedHat"
+
+  roles:
+    - role: docker
+      tags: docker
+
+    - role: container_app                 # ---- Nagios container ----
+      vars:
+        app_name: nagios
+        app_image: custom-nagios
+        app_dockerfile: Dockerfile.nagios
+        app_extra_files:
+          - nagios-entrypoint.sh
+        app_ports:
+          - "8081:80"
+        app_env:
+          NAGIOS_USER: nagiosadmin
+          NAGIOS_PASS: "{{ vault_nagios_password }}"
+      tags: nagios
+
+    - role: container_app                 # ---- Prometheus container ----
+      vars:
+        app_name: prometheus
+        app_image: custom-prometheus
+        app_dockerfile: Dockerfile.prometheus
+        app_extra_files:
+          - prometheus.yml
+        app_ports:
+          - "9090:9090"
+        app_volumes:
+          - "prometheus_data:/prometheus"
+      tags: prometheus
+
+  post_tasks:
+    - name: Check that Nagios responds
+      ansible.builtin.uri:
+        url: "http://localhost:8081/nagios/"
+        user: nagiosadmin
+        password: "{{ vault_nagios_password }}"
+        force_basic_auth: true
+        status_code: 200
+      register: nagios_check
+      retries: 10
+      delay: 6
+      until: nagios_check.status == 200
+      no_log: true
+      tags: nagios
+
+    - name: Check that Prometheus is ready
+      ansible.builtin.uri:
+        url: "http://localhost:9090/-/ready"
+        status_code: 200
+      register: prom_check
+      retries: 10
+      delay: 5
+      until: prom_check.status == 200
+      tags: prometheus

@@ -1,0 +1,59 @@
+---
+- name: Install prerequisites
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - python3-debian          # required by deb822_repository
+    state: present
+    update_cache: true
+
+- name: Remove old/conflicting Docker packages
+  ansible.builtin.apt:
+    name:
+      - docker.io
+      - docker-compose
+      - docker-compose-v2
+      - docker-doc
+      - podman-docker
+    state: absent
+
+- name: Create the apt keyrings directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Import the Docker GPG key
+  ansible.builtin.get_url:
+    url: "https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg"
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+
+- name: Add the Docker repository
+  ansible.builtin.deb822_repository:
+    name: docker
+    types: deb
+    uris: "https://download.docker.com/linux/{{ ansible_distribution | lower }}"
+    suites: "{{ ansible_distribution_release }}"
+    components: stable
+    architectures: "{{ 'amd64' if ansible_architecture == 'x86_64' else 'arm64' }}"
+    signed_by: /etc/apt/keyrings/docker.asc
+    state: present
+    enabled: true
+
+- name: Install the Docker packages
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+    update_cache: true
+
+- name: Install the Docker SDK for Python
+  ansible.builtin.apt:
+    name: python3-docker
+    state: present

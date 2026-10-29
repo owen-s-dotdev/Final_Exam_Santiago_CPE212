@@ -1,0 +1,22 @@
+---
+# tasks file for roles/docker
+- name: Install Docker (OS-specific tasks)
+  ansible.builtin.include_tasks: "install_{{ ansible_os_family | lower }}.yml"
+
+- name: Enable and start Docker and its socket
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+  loop:
+    - docker.service
+    - docker.socket
+
+- name: Add the connecting user to the docker group
+  ansible.builtin.user:
+    name: "{{ ansible_user | default(lookup('env', 'USER')) }}"
+    groups: docker
+    append: true
+
+- name: Apply the new group membership
+  ansible.builtin.meta: reset_connection
